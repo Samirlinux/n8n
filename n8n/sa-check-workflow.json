@@ -1,0 +1,139 @@
+{
+  "name": "SA Check - Server Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sa-check",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "sa-webhook",
+      "name": "Receive Health Check",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        0
+      ],
+      "webhookId": "sa-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// SA Check - Company Lookup (auto-registers new servers) + central alert rules\n// Author: Eng. Samir Abou El Khair\n\n// ---- 1) Custom names (optional): one per line, \"IP = name\" ----\n// Any server NOT listed here is registered automatically with the hostname\n// it reports, so you only list servers whose name you want to override.\nconst table = `\n203.0.113.10 = server.example-company-a.com\n203.0.113.11 = server.example-company-b.com\n`;\n\n// ---- 2) Alert rules ----\nconst ignoredServices = [\"php-fpm\"];          // never alert, on any server\nconst perServerIgnoredServices = {};          // { \"IP\": [\"service\"] }\nconst DEDUP = true;                           // false = alert on every run\nconst REMINDER_MS = 60 * 60 * 1000;           // reminder while still broken\n\nconst staticData = $getWorkflowStaticData('global');\nstaticData.servers = staticData.servers || {};\nstaticData.lastAlerts = staticData.lastAlerts || {};\n\nconst custom = {};\nfor (const line of table.split(\"\\n\")) {\n  const i = line.indexOf(\"=\");\n  if (i > 0) custom[line.slice(0, i).trim()] = line.slice(i + 1).trim();\n}\n\nconst input = $input.first().json;\nconst data = input.body || input;\nconst ip = data.ip;\nconst nowIso = new Date().toISOString();\n\n// Name priority: custom table > already registered > reported hostname.\nconst reg = staticData.servers[ip];\nlet company = custom[ip];\nif (!company) {\n  if (reg && !reg.name.startsWith(\"Unnamed\")) {\n    company = reg.name;\n  } else {\n    company = data.hostname || (reg && reg.name) || (\"Unnamed (\" + ip + \")\");\n  }\n}\nstaticData.servers[ip] = {\n  name: company,\n  firstSeen: reg ? reg.firstSeen : nowIso,\n  lastSeen: nowIso,\n};\n\n// Status is decided here, centrally.\nconst ignored = [...ignoredServices, ...(perServerIgnoredServices[ip] || [])];\nlet status = \"ok\";\nfor (const [service, state] of Object.entries(data.services || {})) {\n  if (state === \"stopped\" && !ignored.includes(service)) {\n    status = \"critical\";\n    break;\n  }\n}\nif (status === \"ok\") {\n  const disk = data.resources?.disk_usage_percent ?? 0;\n  const ram = data.resources?.ram_usage_percent ?? 0;\n  if (disk >= 90 || ram >= 90) status = \"warning\";\n}\n\n// De-duplication: alert on status change, then hourly while still broken.\nif (status === \"ok\") {\n  delete staticData.lastAlerts[ip];           // recovered: next problem alerts at once\n} else if (DEDUP) {\n  const last = staticData.lastAlerts[ip];\n  const nowMs = Date.now();\n  const send = !last || last.status !== status || nowMs - last.time >= REMINDER_MS;\n  if (!send) return [];\n  staticData.lastAlerts[ip] = { status, time: nowMs };\n}\n\nreturn [{ json: { ...data, company, status } }];\n"
+      },
+      "id": "sa-lookup",
+      "name": "Company Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "sa-cond",
+              "leftValue": "={{$json.status}}",
+              "rightValue": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "sa-if",
+      "name": "IF OK",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        20,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "sa-noop",
+      "name": "All good",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🚨 SERVER ALERT\n\n🏢 Company: {{$json.company}}\n🖥 Server: {{$json.server}}\n🌐 IP: {{$json.ip}}\n\n{{$json.services.apache === \"stopped\" ? \"❌ Apache: STOPPED\" : \"✅ Apache: Running\"}}\n{{$json.services.mariadb === \"stopped\" ? \"❌ MySQL/MariaDB: STOPPED\" : \"✅ MySQL/MariaDB: Running\"}}\n{{$json.services.exim === \"stopped\" ? \"❌ Exim: STOPPED\" : \"✅ Exim: Running\"}}\n{{$json.services.dovecot === \"stopped\" ? \"❌ Dovecot: STOPPED\" : \"✅ Dovecot: Running\"}}\n{{$json.services['php-fpm'] === \"stopped\" ? \"❌ PHP-FPM: STOPPED\" : \"✅ PHP-FPM: Running\"}}\n\n💾 Disk: {{$json.resources.disk_usage_percent}}%\n🧠 RAM: {{$json.resources.ram_usage_percent}}%\n⚙️ Load: {{$json.resources.load_avg}}\n\n⏰ {{$json.timestamp}}",
+        "additionalFields": {}
+      },
+      "id": "sa-telegram",
+      "name": "Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Receive Health Check": {
+      "main": [
+        [
+          {
+            "node": "Company Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Company Lookup": {
+      "main": [
+        [
+          {
+            "node": "IF OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF OK": {
+      "main": [
+        [
+          {
+            "node": "All good",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
